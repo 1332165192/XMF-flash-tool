@@ -16,6 +16,7 @@ Item {
     Loader {
         id: loader
         anchors.fill: parent
+        asynchronous: true
         sourceComponent: root.pageComp
         onLoaded: {
             if (!item)

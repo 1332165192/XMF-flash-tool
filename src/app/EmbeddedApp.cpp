@@ -5,6 +5,7 @@
 #include <QProcess>
 #include <QThread>
 #include <QWindow>
+#include "core/Util.h"
 
 #ifdef Q_OS_WIN
 #include <windows.h>
@@ -79,8 +80,6 @@ BOOL CALLBACK enumWindowsProc(HWND hwnd, LPARAM param)
         || classText.contains(QStringLiteral("IME"), Qt::CaseInsensitive)
         || titleText == QLatin1String("Default IME"))
         return TRUE;
-    if (!IsWindowVisible(hwnd))
-        return TRUE;
     RECT rect{};
     if (!GetWindowRect(hwnd, &rect))
         return TRUE;
@@ -88,6 +87,11 @@ BOOL CALLBACK enumWindowsProc(HWND hwnd, LPARAM param)
     const bool visible = IsWindowVisible(hwnd) != 0;
     wchar_t title[256] = {0};
     GetWindowTextW(hwnd, title, 255);
+    // The vendor tool is launched hidden (SW_HIDE) so it cannot flash on the
+    // desktop before we reparent it. Hidden main windows still must be
+    // discoverable; only ignore tiny/untitled hidden helper windows.
+    if (!visible && (title[0] == 0 || area < 100 * 100))
+        return TRUE;
     const int score = area + (visible ? 100000000 : 0) + (title[0] ? 50000000 : 0);
     if (score > search->bestScore) {
         search->bestScore = score;
@@ -140,6 +144,15 @@ HWND findTopWindow(DWORD pid)
     return search.best;
 }
 
+
+bool needsElevation(const QString& exePath)
+{
+    const QString name = QFileInfo(exePath).fileName().toLower();
+    return name == QLatin1String("xiaomiflash.exe")
+        || name == QLatin1String("flash_tool.exe")
+        || name == QLatin1String("sprdclientcore.exe");
+}
+
 struct LaunchResult {
     qint64 pid = 0;
     bool ok = false;
@@ -151,7 +164,7 @@ LaunchResult launchHidden(const QString& exe, const QStringList& arguments, cons
     STARTUPINFOW startup{};
     startup.cb = sizeof(startup);
     startup.dwFlags = STARTF_USESHOWWINDOW;
-    startup.wShowWindow = SW_SHOWMINNOACTIVE;
+    startup.wShowWindow = SW_HIDE;
     PROCESS_INFORMATION process{};
 
     QString commandLine = QLatin1Char('"') + QDir::toNativeSeparators(exe) + QLatin1Char('"');
@@ -165,7 +178,7 @@ LaunchResult launchHidden(const QString& exe, const QStringList& arguments, cons
     std::wstring mutableCommand = commandLine.toStdWString();
     const QString nativeWorkDir = QDir::toNativeSeparators(workDir);
     const BOOL created = CreateProcessW(
-        nullptr, mutableCommand.data(), nullptr, nullptr, FALSE, CREATE_UNICODE_ENVIRONMENT, nullptr,
+        nullptr, mutableCommand.data(), nullptr, nullptr, FALSE, CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW, nullptr,
         nativeWorkDir.isEmpty() ? nullptr : reinterpret_cast<LPCWSTR>(nativeWorkDir.utf16()), &startup,
         &process);
     if (!created)
@@ -190,6 +203,11 @@ EmbeddedApp::EmbeddedApp(QObject* parent)
         if (!m_pid)
             return;
         const HWND hwnd = findTopWindow(DWORD(m_pid));
+        if (!m_embedded && m_launchClock.isValid() && m_launchClock.elapsed() > 10000) {
+            setError(QStringLiteral("工具窗口在 10 秒内没有出现。该工具可能需要管理员权限，或只能在独立窗口中运行。"));
+            m_pollTimer.stop();
+            return;
+        }
         if (!hwnd)
             return;
         if (!m_embedded) {
@@ -269,27 +287,15 @@ bool EmbeddedApp::start(const QString& exePath, const QStringList& arguments, co
         setError(QStringLiteral("找不到工具：") + exePath);
         return false;
     }
+    if (needsElevation(exePath) && !util::isAdmin()) {
+        setError(QStringLiteral("该工具需要管理员权限。请以管理员身份运行 XMF 后再打开，或在“官方工具”中独立启动。"));
+        return false;
+    }
 
     qint64 pid = 0;
 #ifdef Q_OS_WIN
-    // Vendor tools are usually single-instance. A stale instance would either
-    // forward our launch to it (leaving a separate window) or refuse to embed,
-    // so close the old one and start a fresh, hidden process that we can adopt.
-    const qint64 existingPid = findProcessByExe(exePath);
-    if (existingPid > 0) {
-        const HANDLE stale = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, DWORD(existingPid));
-        if (stale) {
-            TerminateProcess(stale, 0);
-            WaitForSingleObject(stale, 1500);
-            CloseHandle(stale);
-        }
-        for (int i = 0; i < 30; ++i) {
-            if (findProcessByExe(exePath) == 0)
-                break;
-            QThread::msleep(100);
-        }
-        QThread::msleep(200);
-    }
+    // Do not block the UI thread by hunting/terminating stale vendor processes.
+    // A real stale instance is handled by the tool's own single-instance logic.
     const LaunchResult launched = launchHidden(exePath, arguments, workingDir);
     if (launched.ok)
         pid = launched.pid;
@@ -303,6 +309,8 @@ bool EmbeddedApp::start(const QString& exePath, const QStringList& arguments, co
         pid = fallbackPid;
     }
     m_pid = pid;
+    m_launchClock.start();
+    m_pollTimer.setInterval(200);
     m_pollTimer.start();
     emit stateChanged();
     return true;
@@ -367,6 +375,7 @@ void EmbeddedApp::adoptWindow(qintptr handle)
     m_extraTimer.start();
     QTimer::singleShot(3000, this, [this]() {
         m_settleTimer.stop();
+        m_extraTimer.stop();
         adoptExtraWindows();
         measureChild();
     });
@@ -522,7 +531,7 @@ void EmbeddedApp::applyGeometry()
     if (w <= 0 || h <= 0)
         return;
     SetWindowPos(reinterpret_cast<HWND>(m_childHwnd), HWND_TOP, x, y, w, h,
-                 SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED);
+                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
     updateDimOverlay();
 #endif
 }
@@ -593,7 +602,8 @@ void EmbeddedApp::close()
     if (m_pid) {
         const HANDLE process = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, DWORD(m_pid));
         if (process) {
-            const DWORD wait = WaitForSingleObject(process, 250);
+            // Never block the UI for a slow vendor process; give it one frame to close.
+            const DWORD wait = WaitForSingleObject(process, 50);
             if (wait != WAIT_OBJECT_0)
                 TerminateProcess(process, 0);
             CloseHandle(process);

@@ -12,12 +12,16 @@ Window {
     minimumWidth: 1040
     minimumHeight: 680
     visible: true
+    visibility: Window.Windowed
     color: Theme.windowBg
     title: "XMF Flash Tool"
     flags: Qt.Window | Qt.FramelessWindowHint
 
     readonly property bool maximized: visibility === Window.Maximized
     property bool forceClose: false
+    property bool updateDismissed: false
+    property bool updateErrorDismissed: false
+    property string pendingEmbeddedTool: ""
     property int navIndex: 0
     property string currentPage: "console"
     property bool noticeAccepted: false
@@ -27,19 +31,27 @@ Window {
             opacity = 0
             introFade.start()
         }
-        const w = Number(App.settings.get("ui/windowWidth", 1180))
-        const h = Number(App.settings.get("ui/windowHeight", 760))
-        width = Math.max(minimumWidth, w)
-        height = Math.max(minimumHeight, h)
+        const screenW = screen.width
+        const screenH = screen.height
+        const defaultW = Math.min(1180, Math.max(minimumWidth, screenW - 80))
+        const defaultH = Math.min(760, Math.max(minimumHeight, screenH - 100))
+        const savedW = Number(App.settings.get("ui/windowWidth", defaultW))
+        const savedH = Number(App.settings.get("ui/windowHeight", defaultH))
+        // Older builds could persist a screen-sized window; treat that as
+        // "maximized" and start in a normal centered window instead.
+        const looksFullscreen = savedW >= screenW - 20 || savedH >= screenH - 20
+        width = Math.max(minimumWidth, Math.min(looksFullscreen ? defaultW : savedW, screenW - 40))
+        height = Math.max(minimumHeight, Math.min(looksFullscreen ? defaultH : savedH, screenH - 60))
         const x = Number(App.settings.get("ui/windowX", -1))
         const y = Number(App.settings.get("ui/windowY", -1))
-        if (x >= 0 && y >= 0) {
+        if (!looksFullscreen && x >= 0 && y >= 0) {
             win.x = Math.max(0, Math.min(x, Math.max(0, screen.width - width)))
             win.y = Math.max(0, Math.min(y, Math.max(0, screen.height - height)))
         } else {
             win.x = Math.max(0, (screen.width - width) / 2)
             win.y = Math.max(0, (screen.height - height) / 2)
         }
+        win.showNormal()
     }
 
     onClosing: function(close) {
@@ -150,7 +162,17 @@ Window {
     }
 
     function openEmbeddedTool(toolId) {
-        pushPage(embeddedComp, { "toolId": toolId }, "embedded")
+        // Official tools now always open as a normal top-level window. Never
+        // create a native child HWND: it would paint above QML and block the
+        // mandatory notice / dialogs.
+        if (!noticeAccepted) {
+            pendingEmbeddedTool = toolId
+            return
+        }
+        if (!App.officialTools.launch(toolId))
+            App.notify("error", "无法启动官方工具：" + toolId)
+        else
+            App.notify("info", "已在新窗口打开官方工具")
     }
 
     function autoReadDevicePartitions() {
@@ -957,7 +979,140 @@ Window {
                         text: "我已知晓，继续使用"
                         kind: 0
                         small: true
-                        onClicked: win.noticeAccepted = true
+                        onClicked: {
+                            win.noticeAccepted = true
+                            win.updateDismissed = false
+                            win.updateErrorDismissed = false
+                            App.checkForUpdates()
+                            if (win.pendingEmbeddedTool !== "") {
+                                const pending = win.pendingEmbeddedTool
+                                win.pendingEmbeddedTool = ""
+                                Qt.callLater(function() { win.openEmbeddedTool(pending) })
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Rectangle {
+        id: updateDialog
+        anchors.fill: parent
+        visible: win.noticeAccepted && App.updateAvailable && !win.updateDismissed
+        color: "#99000000"
+        z: 20001
+
+        MouseArea { anchors.fill: parent; onClicked: {} }
+
+        Rectangle {
+            width: Math.min(460, parent.width - 48)
+            height: 220
+            anchors.centerIn: parent
+            radius: 12
+            color: Theme.panel
+            border.width: 1
+            border.color: Theme.borderStrong
+
+            Column {
+                anchors.fill: parent
+                anchors.margins: 20
+                spacing: 10
+
+                Text {
+                    text: "发现新版本"
+                    color: Theme.text
+                    font.pixelSize: 17
+                    font.bold: true
+                }
+                Text {
+                    width: parent.width
+                    text: "当前版本 " + App.version + "，最新版本 " + App.latestVersion + "。"
+                    color: Theme.textSub
+                    font.pixelSize: 12
+                    wrapMode: Text.WordWrap
+                }
+                Text {
+                    width: parent.width
+                    text: "建议前往 GitHub Release 下载最新安装包。"
+                    color: Theme.textMuted
+                    font.pixelSize: 11
+                    wrapMode: Text.WordWrap
+                }
+                Item { width: 1; height: 4 }
+                Row {
+                    width: parent.width
+                    spacing: 8
+                    Item { width: parent.width - 260; height: 1 }
+                    AppButton {
+                        text: "稍后"
+                        kind: 2
+                        small: true
+                        onClicked: win.updateDismissed = true
+                    }
+                    AppButton {
+                        text: "前往 GitHub Release 下载"
+                        kind: 0
+                        small: true
+                        onClicked: Qt.openUrlExternally(App.updateUrl)
+                    }
+                }
+            }
+        }
+    }
+
+    Rectangle {
+        id: updateErrorDialog
+        anchors.fill: parent
+        visible: win.noticeAccepted && App.updateCheckFailed && !win.updateErrorDismissed
+        color: "#99000000"
+        z: 20002
+
+        MouseArea { anchors.fill: parent; onClicked: {} }
+
+        Rectangle {
+            width: Math.min(460, parent.width - 48)
+            height: 210
+            anchors.centerIn: parent
+            radius: 12
+            color: Theme.panel
+            border.width: 1
+            border.color: Theme.borderStrong
+
+            Column {
+                anchors.fill: parent
+                anchors.margins: 20
+                spacing: 10
+
+                Text {
+                    text: "无法查询最新版本"
+                    color: Theme.text
+                    font.pixelSize: 17
+                    font.bold: true
+                }
+                Text {
+                    width: parent.width
+                    text: "请点击下方按钮前往 GitHub 查询最新版本。"
+                    color: Theme.textSub
+                    font.pixelSize: 12
+                    wrapMode: Text.WordWrap
+                }
+                Item { width: 1; height: 6 }
+                Row {
+                    width: parent.width
+                    spacing: 8
+                    Item { width: parent.width - 280; height: 1 }
+                    AppButton {
+                        text: "稍后"
+                        kind: 2
+                        small: true
+                        onClicked: win.updateErrorDismissed = true
+                    }
+                    AppButton {
+                        text: "前往 GitHub 查询最新版本"
+                        kind: 0
+                        small: true
+                        onClicked: Qt.openUrlExternally("https://github.com/xmz7891/XMF-flash-tool/releases/latest")
                     }
                 }
             }

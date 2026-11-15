@@ -72,6 +72,23 @@ GeekFlashPacket resource packages are provided by the user.
 '@
 Set-Content -Path (Join-Path $appDir 'THIRD-PARTY-NOTICES.txt') -Value $licenses -Encoding UTF8
 
+
+function Remove-PrivateArtifacts([string]$dir) {
+    # Never ship the private bug-mining harness/reports, even if they were left
+    # in the portable staging directories by a local run.
+    $names = @('XMF-ParserFuzz.exe', 'XMF-漏洞自检.bat', 'XMF_fuzz_crashes',
+               'XMF_fuzz_crash_report.txt')
+    foreach ($name in $names) {
+        $target = Join-Path $dir $name
+        if (Test-Path -LiteralPath $target) {
+            Remove-Item -LiteralPath $target -Recurse -Force
+        }
+    }
+    Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like 'last_*.bin' -or $_.Name -like 'XMF_vulnerability_report_*.txt' } |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+}
+
 function New-Zip([string]$sourceDir, [string]$zipPath) {
     if (Test-Path $zipPath) { Remove-Item -Force $zipPath }
     Write-Host "Compressing $sourceDir -> $zipPath ..." -ForegroundColor Yellow
@@ -90,6 +107,8 @@ function New-Zip([string]$sourceDir, [string]$zipPath) {
     Write-Host "Package: $zipPath ($sizeMb MB)" -ForegroundColor Green
 }
 
+Remove-PrivateArtifacts $appDir
+
 # ---- lite package: app + docs only -----------------------------------------
 New-Zip $appDir (Join-Path $distRoot "XMF-Flash-Tool-v$version-lite.zip")
 
@@ -103,6 +122,7 @@ if ($Full -or -not $SkipZip) {
         Write-Host 'Copying data (official tools + drivers + packs + platform-tools)...' -ForegroundColor Yellow
         Copy-Item -Recurse -Force $dataSrc (Join-Path $fullDir 'data')
     }
+    Remove-PrivateArtifacts $fullDir
     New-Zip $fullDir (Join-Path $distRoot "XMF-Flash-Tool-v$version-full.zip")
 }
 

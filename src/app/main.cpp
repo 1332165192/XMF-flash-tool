@@ -93,6 +93,8 @@ int main(int argc, char* argv[])
                                            QStringLiteral("Accept the disclaimer (persisted) and exit"));
     QCommandLineOption noAutoSwitchOpt(QStringLiteral("no-auto-switch"),
                                        QStringLiteral("Disable automatic flash-mode switching for this launch"));
+    QCommandLineOption newInstanceOpt(QStringLiteral("new-instance"),
+                                       QStringLiteral("Start a separate instance (used for elevated relaunch)"));
     QCommandLineOption previewDisclaimerOpt(QStringLiteral("preview-disclaimer"),
                                             QStringLiteral("Force the first-run disclaimer to show"));
     QCommandLineOption batchToolOpt(QStringLiteral("batch-tool"),
@@ -123,6 +125,7 @@ int main(int argc, char* argv[])
     parser.addOption(acceptDisclaimerOpt);
     parser.addOption(noAutoSwitchOpt);
     parser.addOption(previewDisclaimerOpt);
+    parser.addOption(newInstanceOpt);
     parser.addOption(batchToolOpt);
     parser.addOption(batchFieldOpt);
     parser.addOption(batchFilesOpt);
@@ -167,7 +170,7 @@ int main(int argc, char* argv[])
     else if (!guiMode)
         controller.skipDisclaimerForAutomation();
     const QString instanceName = QStringLiteral("XMF-Flash-Tool-Instance");
-    if (guiMode) {
+    if (guiMode && !parser.isSet(newInstanceOpt)) {
         QLocalSocket probe;
         probe.connectToServer(instanceName);
         if (probe.waitForConnected(300)) {
@@ -178,7 +181,7 @@ int main(int argc, char* argv[])
         }
     }
     QLocalServer instanceServer;
-    if (guiMode) {
+    if (guiMode && !parser.isSet(newInstanceOpt)) {
         QLocalServer::removeServer(instanceName);
         instanceServer.listen(instanceName);
     }

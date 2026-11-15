@@ -16,11 +16,21 @@
 #include <QCoreApplication>
 #include <QClipboard>
 #include <QDateTime>
+#include <QNetworkReply>
+#include <QNetworkRequest>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QUrl>
 #include <QGuiApplication>
 #include <QMetaEnum>
 #include <QStyleHints>
 #include <QRunnable>
 #include <QThreadPool>
+
+#ifdef Q_OS_WIN
+#include <windows.h>
+#include <shellapi.h>
+#endif
 
 namespace gf {
 
@@ -313,9 +323,83 @@ QVariantList AppController::flashPorts() const
     return out;
 }
 
+void AppController::relaunchAsAdmin(const QString& toolId)
+{
+#ifdef Q_OS_WIN
+    const QString exe = QCoreApplication::applicationFilePath();
+    const QString args = QStringLiteral("--new-instance --embed \"%1\"").arg(toolId);
+    std::wstring exeW = exe.toStdWString();
+    std::wstring argsW = args.toStdWString();
+    const HINSTANCE result = ShellExecuteW(nullptr, L"runas", exeW.c_str(), argsW.data(),
+                                           nullptr, SW_SHOWNORMAL);
+    if (reinterpret_cast<INT_PTR>(result) > 32) {
+        QTimer::singleShot(250, qApp, []() { QCoreApplication::quit(); });
+        return;
+    }
+#endif
+    notify(QStringLiteral("error"), QStringLiteral("无法以管理员身份重启"));
+}
+
+void AppController::checkForUpdates()
+{
+    if (m_updateChecking)
+        return;
+    m_updateChecking = true;
+    m_updateCheckFailed = false;
+    m_updateAvailable = false;
+    emit updateStateChanged();
+    QNetworkRequest request(QUrl(QStringLiteral(
+        "https://api.github.com/repos/xmz7891/XMF-flash-tool/releases/latest")));
+    request.setHeader(QNetworkRequest::UserAgentHeader,
+                      QStringLiteral("XMF-Flash-Tool/") + version());
+    request.setRawHeader("Accept", "application/vnd.github+json");
+    QNetworkReply* reply = m_network.get(request);
+    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+        reply->deleteLater();
+        m_updateChecking = false;
+        if (reply->error() != QNetworkReply::NoError) {
+            m_updateCheckFailed = true;
+            emit updateStateChanged();
+            return;
+        }
+        const QJsonObject obj = QJsonDocument::fromJson(reply->readAll()).object();
+        QString tag = obj.value(QStringLiteral("tag_name")).toString().trimmed();
+        const QString url = obj.value(QStringLiteral("html_url")).toString().trimmed();
+        if (tag.startsWith(QLatin1Char('v')) || tag.startsWith(QLatin1Char('V')))
+            tag.remove(0, 1);
+        auto parts = [](const QString& v) {
+            QList<int> out;
+            for (const QString& part : v.split(QLatin1Char('.')))
+                out.append(part.toInt());
+            return out;
+        };
+        const QList<int> current = parts(version());
+        const QList<int> latest = parts(tag);
+        bool newer = false;
+        const int n = qMax(current.size(), latest.size());
+        for (int i = 0; i < n; ++i) {
+            const int a = i < current.size() ? current.at(i) : 0;
+            const int b = i < latest.size() ? latest.at(i) : 0;
+            if (b > a) { newer = true; break; }
+            if (b < a) { break; }
+        }
+        m_latestVersion = tag;
+        m_updateUrl = url.isEmpty()
+            ? QStringLiteral("https://github.com/xmz7891/XMF-flash-tool/releases/latest")
+            : url;
+        m_updateAvailable = newer && !tag.isEmpty();
+        m_updateCheckFailed = tag.isEmpty();
+        emit updateStateChanged();
+    });
+}
+
 QVariantList AppController::tools() const
 {
-    return ToolRegistry::instance().tools();
+    // Tools are registered once during initialize(); cache the 220 QVariantMap
+    // entries so page switches do not rebuild them on every property access.
+    if (m_toolsCache.isEmpty())
+        m_toolsCache = ToolRegistry::instance().tools();
+    return m_toolsCache;
 }
 
 QVariantList AppController::categories() const

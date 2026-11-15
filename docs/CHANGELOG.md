@@ -1,3 +1,13 @@
+## v0.3.0
+
+- 官方工具改为独立窗口启动，不再内嵌
+- 修复免费声明期间原生子窗口覆盖/阻塞界面的问题
+- 默认窗口化并修复旧的 1920x1080 全屏尺寸缓存
+- Release 构建改为 Windows GUI 子系统，无控制台窗口
+- 页面异步加载并缓存工具列表，降低切页延迟
+- 新增 GitHub 最新版本自动检查；查询失败提供 Release 入口
+- 清理并禁止打包私有 bug 扫描器/报告
+
 ## v0.21
 
 - 新增 4 个文件解析工具：Qualcomm MBN/ELF、Oplus Digest、MTK Legacy PMT/MPT、Samsung PIT

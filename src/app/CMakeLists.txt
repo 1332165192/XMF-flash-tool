@@ -9,7 +9,7 @@ set(APP_SOURCES
 
 qt_add_executable(XMF ${APP_SOURCES})
 set_target_properties(XMF PROPERTIES
-    WIN32_EXECUTABLE $<IF:$<CONFIG:Debug>,FALSE,TRUE>
+    WIN32_EXECUTABLE TRUE
     OUTPUT_NAME "XMF"
 )
 

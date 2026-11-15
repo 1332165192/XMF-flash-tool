@@ -2,6 +2,7 @@
 
 #include <QHash>
 #include <QObject>
+#include <QNetworkAccessManager>
 #include <QVariantList>
 #include <QVariantMap>
 
@@ -47,6 +48,11 @@ class AppController : public QObject {
     Q_PROPERTY(QVariantMap deviceMode READ deviceMode NOTIFY deviceModeChanged)
     Q_PROPERTY(QString guideFile READ guideFile WRITE setGuideFile NOTIFY guideFileChanged)
     Q_PROPERTY(QString freeNoticeText READ freeNoticeText CONSTANT)
+    Q_PROPERTY(bool updateAvailable READ updateAvailable NOTIFY updateStateChanged)
+    Q_PROPERTY(bool updateCheckFailed READ updateCheckFailed NOTIFY updateStateChanged)
+    Q_PROPERTY(bool updateChecking READ updateChecking NOTIFY updateStateChanged)
+    Q_PROPERTY(QString latestVersion READ latestVersion NOTIFY updateStateChanged)
+    Q_PROPERTY(QString updateUrl READ updateUrl NOTIFY updateStateChanged)
 
 public:
     static AppController& instance();
@@ -85,6 +91,11 @@ public:
     QString guideFile() const;
     void setGuideFile(const QString& path);
     QString freeNoticeText() const { return gf::notice::text(); }
+    bool updateAvailable() const { return m_updateAvailable; }
+    bool updateCheckFailed() const { return m_updateCheckFailed; }
+    bool updateChecking() const { return m_updateChecking; }
+    QString latestVersion() const { return m_latestVersion; }
+    QString updateUrl() const { return m_updateUrl; }
 
     Q_INVOKABLE int runTool(const QString& id, const QVariantMap& options);
     Q_INVOKABLE QVariantMap toolInfo(const QString& id) const;
@@ -121,6 +132,10 @@ public:
 
     Q_INVOKABLE void scanPorts();
     Q_INVOKABLE void refreshDevices();
+    /// Query the GitHub Releases API once per launch, without blocking the UI.
+    Q_INVOKABLE void checkForUpdates();
+    /// Relaunch XMF elevated and open the given official tool embedded.
+    Q_INVOKABLE void relaunchAsAdmin(const QString& toolId);
     Q_INVOKABLE QVariantList driverStatus();
     Q_INVOKABLE QString driverSummaryText();
     Q_INVOKABLE bool installDrivers();
@@ -152,6 +167,7 @@ signals:
     void disclaimerAcceptedChanged();
     void deviceModeChanged();
     void guideFileChanged();
+    void updateStateChanged();
     void notifyRequested(const QString& type, const QString& message);
 
 private:
@@ -172,6 +188,13 @@ private:
     bool m_driverStatusLoaded = false;
     bool m_refreshingDevices = false;
     bool m_initialized = false;
+    mutable QVariantList m_toolsCache;
+    QNetworkAccessManager m_network;
+    bool m_updateChecking = false;
+    bool m_updateAvailable = false;
+    bool m_updateCheckFailed = false;
+    QString m_latestVersion;
+    QString m_updateUrl;
 
     struct BatchEntry {
         QString label;

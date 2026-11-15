@@ -6,6 +6,7 @@
 #include <QStringList>
 #include <QList>
 #include <QTimer>
+#include <QElapsedTimer>
 
 class QWindow;
 
@@ -77,6 +78,7 @@ private:
     QTimer m_settleTimer;
     QTimer m_geometryTimer;
     QTimer m_extraTimer;
+    QElapsedTimer m_launchClock;
     QList<qintptr> m_extraWindows;
     int m_areaX = 0;
     int m_areaY = 0;

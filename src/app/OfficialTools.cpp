@@ -8,6 +8,11 @@
 #include <QProcess>
 #include <QStandardPaths>
 
+#ifdef Q_OS_WIN
+#include <windows.h>
+#include <shellapi.h>
+#endif
+
 namespace gf {
 
 namespace {
@@ -176,6 +181,20 @@ bool OfficialTools::launch(const QString& id)
             return false;
         const QString exe = map.value(QStringLiteral("path")).toString();
         const QString dir = map.value(QStringLiteral("dir")).toString();
+#ifdef Q_OS_WIN
+        const QString name = QFileInfo(exe).fileName().toLower();
+        const bool needsAdmin = name == QLatin1String("xiaomiflash.exe")
+            || name == QLatin1String("flash_tool.exe")
+            || name == QLatin1String("sprdclientcore.exe");
+        const std::wstring exeW = QDir::toNativeSeparators(exe).toStdWString();
+        const std::wstring dirW = QDir::toNativeSeparators(dir).toStdWString();
+        const wchar_t* verb = (needsAdmin && !util::isAdmin()) ? L"runas" : L"open";
+        const HINSTANCE result = ShellExecuteW(nullptr, verb, exeW.c_str(), nullptr,
+                                               dirW.empty() ? nullptr : dirW.c_str(),
+                                               SW_SHOWNORMAL);
+        if (reinterpret_cast<INT_PTR>(result) > 32)
+            return true;
+#endif
         return QProcess::startDetached(exe, {}, dir);
     }
     return false;

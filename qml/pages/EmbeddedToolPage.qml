@@ -179,12 +179,8 @@ Item {
                 // default: fill the frame; once the tool reports its content size
                 // and cannot fill it, centre a correctly sized host instead of
                 // cropping the vendor window.
-                width: App.embedded.childSizeValid
-                       ? Math.min(frame.width - 2, Math.max(360, App.embedded.childWidth))
-                       : frame.width - 2
-                height: App.embedded.childSizeValid
-                        ? Math.min(frame.height - 2, Math.max(240, App.embedded.childHeight))
-                        : frame.height - 2
+                width: frame.width - 2
+                height: frame.height - 2
                 anchors.centerIn: parent
 
                 Behavior on width { NumberAnimation { duration: Theme.durNormal; easing.type: Theme.easing } }
@@ -225,8 +221,17 @@ Item {
                 color: App.embedded.error !== "" ? Theme.danger : Theme.textMuted
                 font.pixelSize: 10
                 elide: Text.ElideRight
-                width: parent.width
+                width: parent.width - (elevatedButton.visible ? 130 : 0)
                 anchors.verticalCenter: parent.verticalCenter
+            }
+            AppButton {
+                id: elevatedButton
+                visible: App.embedded.error.indexOf("管理员") >= 0 && !App.admin
+                text: "以管理员重启"
+                kind: 0
+                small: true
+                anchors.verticalCenter: parent.verticalCenter
+                onClicked: App.relaunchAsAdmin(page.toolId)
             }
         }
     }
