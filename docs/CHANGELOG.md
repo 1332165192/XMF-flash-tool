@@ -1,3 +1,12 @@
+## v0.3.1
+
+- 修复全志 FEL 在 A133 等设备上的握手超时
+- 补全 32 字节 AWUC USB 请求头与 16 字节 FEL 请求
+- 修正 FEL_READ / FEL_WRITE / FEL_EXEC 命令码与字段顺序
+- 独立消费 13 字节 AWUS ACK 和 8 字节 FEL status
+- 修正 AWUSBFEX 的 SoC ID / 协议版本解析，新增 A133
+- FEL 失败后提示断电重启设备
+
 ## v0.3.0
 
 - 官方工具改为独立窗口启动，不再内嵌
