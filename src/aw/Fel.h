@@ -2,24 +2,19 @@
 
 // Allwinner FEL protocol (PhoenixSuit / sunxi-tools compatible).
 //
-// FEL runs in the BootROM of Allwinner SoCs (VID 1F3A, PID 0xEFE8). Every
-// operation is:
+// FEL runs in the BootROM of Allwinner SoCs (VID 1F3A, PID 0xEFE8).
+// The USB framing follows sunxi-tools:
 //
-//   1) host -> device: a 16-byte little-endian request
-//        0x00 u32 request   (FEL_VER / FEL_READ / FEL_WRITE / FEL_EXEC / ...)
-//        0x04 u32 length    (data phase length in bytes)
-//        0x08 u32 address   (target address / offset)
-//        0x0C u32 reserved  (0)
-//   2) data phase (optional):
-//        FEL_WRITE: host -> device, `length` bytes
-//        FEL_READ : device -> host, `length` bytes
-//   3) device -> host: an 8-byte response (status u32, tag u32); status 0 = OK.
+//   1) host -> device: a 32-byte aw_usb_request
+//        magic "AWUC", length, 0x0c000000, request type (0x11 read / 0x12 write),
+//        length2, 10 bytes padding
+//   2) for a FEL_WRITE phase: a 16-byte aw_fel_request
+//        request u32, address u32, length u32, pad u32
+//   3) optional data phase
+//   4) device -> host: a 13-byte "AWUS" acknowledgement
 //
-// FEL_VER additionally returns a version blob in the data phase (32 bytes):
-//   magic[8] = "AWUSBFEX", version u32, id u32 (SoC id), firmware u32[4].
-//
-// Transfers are chunked (16 KiB) because the BootROM bulk endpoint rejects
-// larger requests. Addresses are physical DRAM addresses.
+// FEL command results are read with a separate AW_USB_READ(8) transaction.
+// FEL_VER returns a 32-byte AWUSBFEX payload.
 //
 // TODO(protocols): response size (8 vs 4 bytes) differs on a few BROM builds;
 // the client accepts a short response and only validates the status word.
@@ -33,17 +28,20 @@
 
 namespace gf::aw {
 
-inline constexpr quint32 kHello = 0x001; // aka FEL_VER
+inline constexpr quint32 kHello = 0x001; // FEL_VERSION
 inline constexpr quint32 kVer = 0x001;
-inline constexpr quint32 kRead = 0x011;
-inline constexpr quint32 kWrite = 0x012;
-inline constexpr quint32 kExec = 0x013;
-inline constexpr quint32 kRun = 0x014;
-inline constexpr quint32 kNotify = 0x015;
+inline constexpr quint32 kWrite = 0x101; // FEL_1_WRITE
+inline constexpr quint32 kExec = 0x102;  // FEL_1_EXEC
+inline constexpr quint32 kRead = 0x103;  // FEL_1_READ
+inline constexpr quint32 kRun = 0x104;
 
-inline constexpr quint32 kRequestSize = 16;
-inline constexpr quint32 kResponseSize = 8;
+inline constexpr quint32 kRequestSize = 16;   // aw_fel_request
+inline constexpr quint32 kUsbRequestSize = 32; // aw_usb_request
+inline constexpr quint32 kResponseSize = 8;   // read status payload
+inline constexpr quint32 kAckSize = 13;       // "AWUS" + 9 zero bytes
 inline constexpr quint32 kVersionSize = 32;
+inline constexpr quint8 kUsbRead = 0x11;
+inline constexpr quint8 kUsbWrite = 0x12;
 inline constexpr qsizetype kMaxChunk = 16 * 1024;
 
 struct Request {
@@ -96,11 +94,16 @@ public:
     void run(quint32 address, const QByteArray& image, int timeoutMs = 30000);
 
 private:
-    Response transfer(const Request& request, const QByteArray& outData, QByteArray* inData,
-                      int timeoutMs);
-    Response readResponse(int timeoutMs);
+    void sendUsbRequest(quint8 type, quint32 length, int timeoutMs);
+    void readAck(int timeoutMs);
+    QByteArray readData(quint32 length, int timeoutMs, bool resyncVersion = false);
+    void sendFelRequest(quint32 request, quint32 address, quint32 length, int timeoutMs);
+    QByteArray readUsb(quint32 length, int timeoutMs);
+    void writeUsb(const QByteArray& data, int timeoutMs);
+    void readFelStatus(int timeoutMs);
     usb::IUsbTransport& m_transport;
     proto::Reporter m_reporter;
+    QByteArray m_rx;
 };
 
 } // namespace gf::aw

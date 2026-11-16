@@ -9,7 +9,7 @@ namespace gf::aw {
 
 QByteArray Request::encode() const
 {
-    return proto::u32le(request) + proto::u32le(length) + proto::u32le(address)
+    return proto::u32le(request) + proto::u32le(address) + proto::u32le(length)
            + proto::u32le(reserved);
 }
 
@@ -19,8 +19,8 @@ Request Request::decode(const QByteArray& raw)
     if (raw.size() < int(kRequestSize))
         return request;
     request.request = proto::readU32le(raw, 0);
-    request.length = proto::readU32le(raw, 4);
-    request.address = proto::readU32le(raw, 8);
+    request.address = proto::readU32le(raw, 4);
+    request.length = proto::readU32le(raw, 8);
     request.reserved = proto::readU32le(raw, 12);
     return request;
 }
@@ -55,9 +55,11 @@ VersionInfo parseVersion(const QByteArray& payload)
         return info;
     }
     info.magic = QString::fromLatin1(payload.left(8)).remove(QChar('\0')).trimmed();
-    info.version = proto::readU32le(payload, 8);
-    info.id = proto::readU32le(payload, 12);
-    info.firmware = payload.mid(16);
+    // AWUSBFEX layout (sunxi): soc_id is encoded in the high 16 bits at 8,
+    // protocol version is at 16, scratchpad at 20.
+    info.id = (proto::readU32le(payload, 8) >> 8) & 0xffffu;
+    info.version = proto::readU32le(payload, 16) & 0xffffu;
+    info.firmware = payload.mid(20);
     if (!info.magic.startsWith(QLatin1String("AWUSBFEX"))) {
         info.error = QStringLiteral("FEL 版本魔数错误：%1").arg(info.magic);
         return info;
@@ -100,99 +102,182 @@ QString socName(quint32 id)
     }
 }
 
+namespace {
+QByteArray u32leBytes(quint32 v)
+{
+    QByteArray b(4, 0);
+    b[0] = char(v & 0xff);
+    b[1] = char((v >> 8) & 0xff);
+    b[2] = char((v >> 16) & 0xff);
+    b[3] = char((v >> 24) & 0xff);
+    return b;
+}
+} // namespace
+
 Client::Client(usb::IUsbTransport& transport, proto::Reporter reporter)
     : m_transport(transport), m_reporter(std::move(reporter))
 {
 }
 
-Response Client::readResponse(int timeoutMs)
+void Client::sendUsbRequest(quint8 type, quint32 length, int timeoutMs)
 {
-    // One bulk transfer is enough for the 8-byte response; accepting a short
-    // 4-byte status keeps compatibility with older BROM builds.
-    const QByteArray raw = m_transport.read(kResponseSize, timeoutMs);
-    Response response = Response::decode(raw);
-    if (!response.valid) {
-        const QString reason = m_transport.errorString();
-        throw std::runtime_error(
-            QStringLiteral("FEL 未收到响应（%1 ms）%2")
-                .arg(timeoutMs)
-                .arg(reason.isEmpty() ? QString() : QStringLiteral("：") + reason)
-                .toStdString());
-    }
-    return response;
+    // sunxi aw_usb_request: 8-byte magic, header length, fixed address word,
+    // request type, data length, 10 bytes padding. 32 bytes packed.
+    QByteArray req;
+    req.reserve(kUsbRequestSize);
+    req.append(QByteArrayLiteral("AWUC"));
+    req.append(4, '\0');
+    req.append(u32leBytes(length));
+    req.append(QByteArray::fromHex("0000000c")); // 0x0c000000, little endian
+    req.append(char(type));
+    req.append('\0');
+    req.append(u32leBytes(length));
+    req.append(10, '\0');
+    if (req.size() != int(kUsbRequestSize))
+        throw std::runtime_error("FEL USB request 长度错误");
+    usb::writeAll(m_transport, req, timeoutMs, m_reporter);
 }
 
-Response Client::transfer(const Request& request, const QByteArray& outData, QByteArray* inData,
-                          int timeoutMs)
+void Client::readAck(int timeoutMs)
 {
-    m_reporter.checkCanceled();
-    usb::writeAll(m_transport, request.encode(), timeoutMs, m_reporter);
+    for (int attempt = 0; attempt < 6; ++attempt) {
+        const QByteArray packet = m_rx.isEmpty() ? m_transport.read(4096, timeoutMs) : m_rx;
+        m_rx.clear();
+        if (packet.isEmpty()) {
+            const QString reason = m_transport.errorString();
+            throw std::runtime_error(
+                QStringLiteral("FEL 等待 AWUS 应答超时%1")
+                    .arg(reason.isEmpty() ? QString() : QStringLiteral("：") + reason)
+                    .toStdString());
+        }
+        if (packet.size() >= int(kAckSize) && packet.left(4) == QByteArrayLiteral("AWUS")) {
+            if (packet.size() > int(kAckSize))
+                m_rx = packet.mid(kAckSize);
+            return;
+        }
+        // Unexpected data before the ACK: discard it and read the next packet.
+        // Every write/read phase must end with exactly one 13-byte AWUS packet.
+        m_rx.clear();
+    }
+    throw std::runtime_error("FEL 未收到有效的 AWUS 应答");
+}
 
-    if (request.request == kWrite && !outData.isEmpty())
-        usb::writeAll(m_transport, outData, timeoutMs, m_reporter);
+QByteArray Client::readData(quint32 length, int timeoutMs, bool resyncVersion)
+{
+    QByteArray out;
+    out.reserve(int(length));
+    while (out.size() < int(length)) {
+        QByteArray packet = m_rx.isEmpty() ? m_transport.read(4096, timeoutMs) : m_rx;
+        m_rx.clear();
+        if (packet.isEmpty()) {
+            const QString reason = m_transport.errorString();
+            throw std::runtime_error(
+                QStringLiteral("FEL 读取超时（需要 %1 字节，已收到 %2 字节）%3")
+                    .arg(length).arg(out.size())
+                    .arg(reason.isEmpty() ? QString() : QStringLiteral("：") + reason)
+                    .toStdString());
+        }
+        if (packet.size() >= int(kAckSize) && packet.left(4) == QByteArrayLiteral("AWUS")) {
+            if (packet.size() > int(kAckSize))
+                m_rx = packet.mid(kAckSize);
+            continue;
+        }
+        out.append(packet);
+        if (out.size() > int(length)) {
+            m_rx = out.mid(int(length)) + m_rx;
+            out.truncate(int(length));
+        }
+    }
+    if (resyncVersion) {
+        const int at = out.indexOf(QByteArrayLiteral("AWUSBFEX"));
+        if (at < 0)
+            throw std::runtime_error("FEL 版本数据中找不到 AWUSBFEX");
+        out = out.mid(at);
+    }
+    return out.left(int(length));
+}
 
-    QByteArray data;
-    if (request.request == kRead && request.length > 0)
-        data = usb::readExact(m_transport, request.length, timeoutMs, m_reporter);
-    else if (inData && request.length > 0)
-        data = usb::readExact(m_transport, request.length, timeoutMs, m_reporter);
+void Client::sendFelRequest(quint32 request, quint32 address, quint32 length, int timeoutMs)
+{
+    Request req;
+    req.request = request;
+    req.address = address;
+    req.length = length;
+    // aw_send_fel_request is an AW_USB_WRITE of the 16-byte fel request.
+    sendUsbRequest(kUsbWrite, kRequestSize, timeoutMs);
+    usb::writeAll(m_transport, req.encode(), timeoutMs, m_reporter);
+    readAck(timeoutMs);
+}
 
-    const Response response = readResponse(timeoutMs);
-    if (!response.ok()) {
+QByteArray Client::readUsb(quint32 length, int timeoutMs)
+{
+    sendUsbRequest(kUsbRead, length, timeoutMs);
+    const QByteArray data = readData(length, timeoutMs, length == kVersionSize);
+    readAck(timeoutMs);
+    return data;
+}
+
+void Client::writeUsb(const QByteArray& data, int timeoutMs)
+{
+    sendUsbRequest(kUsbWrite, quint32(data.size()), timeoutMs);
+    usb::writeAll(m_transport, data, timeoutMs, m_reporter);
+    readAck(timeoutMs);
+}
+
+void Client::readFelStatus(int timeoutMs)
+{
+    const QByteArray status = readUsb(kResponseSize, timeoutMs);
+    if (status.size() >= 4 && proto::readU32le(status, 0) != 0) {
         throw std::runtime_error(
-            QStringLiteral("FEL 命令 0x%1 失败：状态 0x%2")
-                .arg(request.request, 0, 16)
-                .arg(response.status, 0, 16)
+            QStringLiteral("FEL 命令失败：状态 0x%1")
+                .arg(proto::readU32le(status, 0), 0, 16)
                 .toStdString());
     }
-    if (inData)
-        *inData = data;
-    return response;
 }
 
 VersionInfo Client::hello(int timeoutMs)
 {
     m_reporter.status(QStringLiteral("FEL 握手（FEL_VER）…"));
-    Request request;
-    request.request = kHello;
-    request.length = kVersionSize;
-
-    QByteArray payload;
-    transfer(request, {}, &payload, timeoutMs);
-    const VersionInfo info = parseVersion(payload);
-    if (!info.valid)
-        throw std::runtime_error(QStringLiteral("FEL 握手失败：%1").arg(info.error).toStdString());
-    m_reporter.info(QStringLiteral("FEL BootROM：%1，SoC %2（0x%3），版本 0x%4")
-                        .arg(info.magic)
-                        .arg(socName(info.id))
-                        .arg(info.id, 8, 16, QLatin1Char('0'))
-                        .arg(info.version, 8, 16, QLatin1Char('0')));
-    return info;
+    try {
+        // Drain a stale ACK left by a previous interrupted transaction; otherwise
+        // the BROM refuses the next OUT transfer.
+        usb::drainInput(m_transport, 100);
+        sendFelRequest(kHello, 0, 0, timeoutMs);
+        const QByteArray payload = readUsb(kVersionSize, timeoutMs);
+        readFelStatus(timeoutMs);
+        const VersionInfo info = parseVersion(payload);
+        if (!info.valid)
+            throw std::runtime_error(QStringLiteral("FEL 握手失败：%1").arg(info.error).toStdString());
+        m_reporter.info(QStringLiteral("FEL BootROM：%1，SoC %2（0x%3），版本 0x%4")
+                            .arg(info.magic)
+                            .arg(socName(info.id))
+                            .arg(info.id, 8, 16, QLatin1Char('0'))
+                            .arg(info.version, 8, 16, QLatin1Char('0')));
+        return info;
+    } catch (const std::exception& error) {
+        throw std::runtime_error(
+            QStringLiteral("%1；FEL 事务可能已中断，请给设备断电重启后重试")
+                .arg(QString::fromUtf8(error.what())).toStdString());
+    }
 }
 
 QByteArray Client::read(quint32 address, quint32 length, int timeoutMs)
 {
     if (length == 0)
         return {};
-    m_reporter.status(
-        QStringLiteral("FEL 读取 0x%1，%2 字节").arg(address, 0, 16).arg(length));
+    m_reporter.status(QStringLiteral("FEL 读取 0x%1，%2 字节").arg(address, 0, 16).arg(length));
     QByteArray all;
     quint32 offset = 0;
     while (offset < length) {
         m_reporter.checkCanceled();
         const quint32 chunk = quint32(qMin<quint32>(length - offset, quint32(kMaxChunk)));
-        Request request;
-        request.request = kRead;
-        request.length = chunk;
-        request.address = address + offset;
-        QByteArray data;
-        transfer(request, {}, &data, timeoutMs);
+        sendFelRequest(kRead, address + offset, chunk, timeoutMs);
+        const QByteArray data = readUsb(chunk, timeoutMs);
+        readFelStatus(timeoutMs);
         if (data.size() != int(chunk)) {
             throw std::runtime_error(
                 QStringLiteral("FEL 读取数据长度不符：期望 %1，实际 %2")
-                    .arg(chunk)
-                    .arg(data.size())
-                    .toStdString());
+                    .arg(chunk).arg(data.size()).toStdString());
         }
         all.append(data);
         offset += chunk;
@@ -207,19 +292,16 @@ void Client::write(quint32 address, const QByteArray& data, qsizetype chunkSize,
         return;
     if (chunkSize <= 0 || chunkSize > kMaxChunk)
         chunkSize = kMaxChunk;
-
     m_reporter.status(QStringLiteral("FEL 写入 0x%1，%2 字节").arg(address, 0, 16).arg(data.size()));
     for (qsizetype offset = 0; offset < data.size(); offset += chunkSize) {
         m_reporter.checkCanceled();
         const QByteArray chunk = data.mid(offset, chunkSize);
-        Request request;
-        request.request = kWrite;
-        request.length = quint32(chunk.size());
-        request.address = address + quint32(offset);
-        transfer(request, chunk, nullptr, timeoutMs);
+        sendFelRequest(kWrite, address + quint32(offset), quint32(chunk.size()), timeoutMs);
+        writeUsb(chunk, timeoutMs);
+        readFelStatus(timeoutMs);
         if (progressSpan > 0) {
-            const int percent =
-                progressBase + int(progressSpan * double(offset + chunk.size()) / data.size());
+            const int percent = progressBase
+                + int(progressSpan * double(offset + chunk.size()) / data.size());
             m_reporter.progress(qMin(percent, progressBase + progressSpan));
         }
     }
@@ -228,10 +310,8 @@ void Client::write(quint32 address, const QByteArray& data, qsizetype chunkSize,
 void Client::exec(quint32 address, int timeoutMs)
 {
     m_reporter.status(QStringLiteral("FEL 执行 0x%1").arg(address, 0, 16));
-    Request request;
-    request.request = kExec;
-    request.address = address;
-    transfer(request, {}, nullptr, timeoutMs);
+    sendFelRequest(kExec, address, 0, timeoutMs);
+    readFelStatus(timeoutMs);
     m_reporter.info(QStringLiteral("FEL EXEC 已发送"));
 }
 
